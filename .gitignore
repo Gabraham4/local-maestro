@@ -1,0 +1,20 @@
+# Generated files
+reports/
+__pycache__/
+*.pyc
+
+# Cached backtest data (user-specific)
+backtest_data/*.json
+!backtest_data/.gitkeep
+
+# OS files
+.DS_Store
+
+# Environment / credentials
+.env
+scripts/.env
+
+# Large media / reference files
+*.mov
+References and Sample Images*/
+Gobi's Portfolio Weigher/
