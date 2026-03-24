@@ -141,8 +141,9 @@ def run_rainboy_backtest(strategy_json_path: str, backtest_sh_path: str = None,
     Returns the same format as load_rainboy_html_report.
     """
     if backtest_sh_path is None:
-        backtest_sh_path = os.path.expanduser(
-            "~/AIProjects/ComposerTrading/MyTools/Rainboy CLI Backtester/backtest.sh"
+        backtest_sh_path = os.environ.get(
+            "RAINBOY_BACKTEST_PATH",
+            os.path.expanduser("~/Rainboy CLI Backtester/backtest.sh"),
         )
 
     if not os.path.exists(backtest_sh_path):
