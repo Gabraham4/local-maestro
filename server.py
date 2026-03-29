@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 # Add lib to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 
-from data_loader import load_composer_backtest_json, align_strategies
+from data_loader import load_composer_backtest_json, align_strategies, stitch_hybrid_backtest, stitch_hybrid_portfolio
 from analytics import PortfolioAnalyzer, optimize_portfolios
 from report import generate_html
 
@@ -52,13 +52,26 @@ def load_credentials():
                     if line and not line.startswith("#") and "=" in line:
                         key, val = line.split("=", 1)
                         creds[key.strip()] = val.strip()
-            return creds.get("COMPOSER_API_KEY", ""), creds.get("COMPOSER_API_SECRET", "")
+            return (creds.get("COMPOSER_API_KEY", ""),
+                    creds.get("COMPOSER_API_SECRET", ""),
+                    creds.get("COMPOSER_ACCOUNT_UUID", ""))
         search = search.parent
-    return "", ""
+    return "", "", ""
 
 
-API_KEY, API_SECRET = load_credentials()
-ACCOUNT_UUID = os.getenv("COMPOSER_ACCOUNT_UUID", "")
+API_KEY, API_SECRET, ACCOUNT_UUID = load_credentials()
+ACCOUNT_UUID = ACCOUNT_UUID or os.getenv("COMPOSER_ACCOUNT_UUID", "")
+
+# Auto-detect Rainboy backtester path
+if not os.environ.get("RAINBOY_BACKTEST_PATH"):
+    for candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Rainboy CLI Backtester", "backtest.sh"),
+        os.path.expanduser("~/Rainboy CLI Backtester/backtest.sh"),
+    ]:
+        if os.path.exists(candidate):
+            os.environ["RAINBOY_BACKTEST_PATH"] = os.path.abspath(candidate)
+            break
+
 BACKTEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_data")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 os.makedirs(BACKTEST_DIR, exist_ok=True)
@@ -104,6 +117,22 @@ def list_portfolio_symphonies():
     return _parse_symphony_list(data, "portfolio")
 
 
+def fetch_symphony_code(symphony_id):
+    """Fetch a symphony's strategy code tree (step/children JSON) from the Composer API."""
+    try:
+        data = composer_api_get(
+            "backtest-api.composer.trade",
+            f"/api/v1/symphonies/{symphony_id}/score?score_version=v1"
+        )
+        if data.get("step") == "root":
+            return data
+        print(f"  [fetch-code] Unexpected response for {symphony_id}: step={data.get('step')}")
+        return None
+    except Exception as e:
+        print(f"  [fetch-code] Failed for {symphony_id}: {e}")
+        return None
+
+
 def list_watchlist_symphonies():
     """List all symphonies in the user's watchlist."""
     try:
@@ -118,20 +147,22 @@ def list_draft_symphonies():
     """List all draft symphonies."""
     try:
         data = composer_api_get("backtest-api.composer.trade", "/api/v1/user/symphonies/drafts")
-        return _parse_symphony_list(data, "draft")
+        return _parse_symphony_list(data, "drafts")
     except Exception as e:
         print(f"  Drafts fetch error: {e}")
         return []
 
 
-def fetch_backtest(symphony_id):
-    """Fetch backtest data for a symphony. Returns cached data if available."""
+def fetch_backtest(symphony_id, force_refresh=False):
+    """Fetch backtest data for a symphony. Caches for the current server session only."""
     cache_path = os.path.join(BACKTEST_DIR, f"{symphony_id}.json")
 
-    # Check cache (less than 24 hours old)
-    if os.path.exists(cache_path):
+    # Use cache only if from this server session (less than 30 minutes old)
+    # This avoids re-fetching the same strategy multiple times in one analysis
+    # but ensures fresh data across sessions
+    if not force_refresh and os.path.exists(cache_path):
         mtime = os.path.getmtime(cache_path)
-        if (datetime.now().timestamp() - mtime) < 86400:
+        if (datetime.now().timestamp() - mtime) < 1800:  # 30 min
             with open(cache_path) as f:
                 return json.load(f)
 
@@ -347,7 +378,7 @@ h3 { color: #a0b0c0; font-size: 16px; margin: 16px 0 8px; }
         <div class="source-tab active" onclick="switchSource('portfolio')">Portfolio</div>
         <div class="source-tab" onclick="switchSource('watchlist')">Watchlist</div>
         <div class="source-tab" onclick="switchSource('drafts')">Drafts</div>
-        <div class="source-tab" onclick="switchSource('local')">Local Cache</div>
+        <div class="source-tab" onclick="switchSource('local')">Local Files</div>
     </div>
 
     <div class="info-bar" id="info-bar">
@@ -391,7 +422,14 @@ h3 { color: #a0b0c0; font-size: 16px; margin: 16px 0 8px; }
         <button onclick="selectNone()">Deselect All (this tab)</button>
         <button onclick="selectLongOnly()">Only 1Y+ History</button>
         <button onclick="deselectEverything()">Clear All Sources</button>
+        <button onclick="clearCache()" title="Delete cached backtests so they're re-fetched on next analyze">Clear Cache</button>
     </div>
+
+    <input type="text" id="strat-search" placeholder="Search strategies..."
+        oninput="renderList()"
+        style="width:100%;padding:10px 14px;background:#1a2332;border:1px solid #2a3a4a;
+        border-radius:6px;color:#c0d0e0;font-size:14px;margin:8px 0;outline:none;"
+        onfocus="this.style.borderColor='#f0a030'" onblur="this.style.borderColor='#2a3a4a'">
 
     <div class="strategy-list" id="strategy-list">
         <div class="strat-header">
@@ -402,10 +440,41 @@ h3 { color: #a0b0c0; font-size: 16px; margin: 16px 0 8px; }
         </div>
     </div>
 
-    <div class="actions">
+    <div style="margin:20px 0;">
+        <h3>Add to Local Files</h3>
+        <div id="drop-zone" style="border:2px dashed #2a3a4a;border-radius:8px;padding:32px;text-align:center;
+            color:#6a7a8a;cursor:pointer;transition:all 0.2s;margin:12px 0;"
+            onclick="document.getElementById('file-input').click()"
+            ondragover="event.preventDefault();this.style.borderColor='#f0a030';this.style.color='#c0d0e0';"
+            ondragleave="this.style.borderColor='#2a3a4a';this.style.color='#6a7a8a';"
+            ondrop="handleDrop(event)">
+            Drop strategy JSON/TXT files here, or click to browse — saved to local_files/
+            <input type="file" id="file-input" multiple accept=".json,.txt" style="display:none"
+                onchange="handleFiles(this.files)">
+        </div>
+    </div>
+
+    <div class="actions" style="align-items:center;">
         <button class="btn btn-primary" id="analyze-btn" onclick="runAnalysis()" disabled>
             Analyze Selected Strategies
         </button>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:#8899aa;font-size:13px;margin-left:16px;">
+            <input type="checkbox" id="synthetic-mode" style="width:18px;height:18px;cursor:pointer;">
+            <span>Extended History</span>
+        </label>
+        <select id="synthetic-engine" style="background:#1a2332;border:1px solid #2a3a4a;color:#8899aa;padding:4px 8px;border-radius:4px;font-size:12px;margin-left:4px;display:none;">
+            <option value="hybrid">Hybrid (Rainboy pre + Composer post)</option>
+            <option value="pure">Pure Rainbow (best for correlations)</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:#8899aa;font-size:13px;margin-left:16px;">
+            <input type="checkbox" id="save-local" style="width:18px;height:18px;cursor:pointer;">
+            <span>Save to Local Files</span>
+        </label>
+        <script>
+            document.getElementById('synthetic-mode').addEventListener('change', function() {
+                document.getElementById('synthetic-engine').style.display = this.checked ? 'inline-block' : 'none';
+            });
+        </script>
     </div>
 </div>
 
@@ -478,9 +547,13 @@ function getSourceStrategies(source) {
 function renderList() {
     const list = document.getElementById('strategy-list');
     const limiter = findLimiter();
+    const searchTerm = (document.getElementById('strat-search').value || '').toLowerCase().trim();
 
-    // Show current source tab strategies
-    const sourceStrats = getSourceStrategies(currentSource);
+    // Show current source tab strategies, filtered by search
+    let sourceStrats = getSourceStrategies(currentSource);
+    if (searchTerm) {
+        sourceStrats = sourceStrats.filter(s => s.name.toLowerCase().includes(searchTerm));
+    }
 
     let html = '<div class="strat-header"><div></div><div>Strategy</div><div>Start</div><div>End</div><div>Days</div></div>';
 
@@ -649,6 +722,9 @@ async function runAnalysis() {
     loadingText.textContent = `Fetching backtests for ${selected.length} strategies...`;
 
     try {
+        const synthetic = document.getElementById('synthetic-mode').checked;
+        const syntheticEngine = document.getElementById('synthetic-engine').value;
+        const saveLocal = document.getElementById('save-local').checked;
         const resp = await fetch('/api/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -656,6 +732,9 @@ async function runAnalysis() {
                 ids: selected,
                 start: getEffectiveStart(),
                 end: getEffectiveEnd(),
+                synthetic: synthetic,
+                synthetic_engine: syntheticEngine,
+                save_local: saveLocal,
             }),
         });
 
@@ -674,6 +753,73 @@ async function runAnalysis() {
     } finally {
         loading.classList.remove('active');
     }
+}
+
+async function clearCache() {
+    if (!confirm('Delete all cached backtests? They will be re-fetched on next Analyze.')) return;
+    try {
+        const resp = await fetch('/api/clear-cache', { method: 'POST' });
+        const result = await resp.json();
+        alert(result.message || 'Cache cleared');
+        // Reset loaded sources so dates refresh
+        loadedSources = {};
+        switchSource(currentSource);
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+// File upload handlers
+function handleDrop(e) {
+    e.preventDefault();
+    e.target.style.borderColor = '#2a3a4a';
+    e.target.style.color = '#6a7a8a';
+    if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+}
+
+async function handleFiles(files) {
+    const dropZone = document.getElementById('drop-zone');
+    const origText = dropZone.innerText;
+    dropZone.innerText = `Uploading ${files.length} file(s)...`;
+    dropZone.style.color = '#f0a030';
+
+    for (const file of files) {
+        try {
+            const text = await file.text();
+            const resp = await fetch('/api/upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, content: text }),
+            });
+            const result = await resp.json();
+            if (result.error) {
+                alert(`Error uploading ${file.name}: ${result.error}`);
+                continue;
+            }
+            // Add to allStrategies as 'upload' source
+            const s = result.strategy;
+            s.source = 'upload';
+            s.checked = true;
+            allStrategies[s.id] = s;
+        } catch (e) {
+            alert(`Failed to upload ${file.name}: ${e.message}`);
+        }
+    }
+
+    dropZone.innerText = origText;
+    dropZone.style.color = '#6a7a8a';
+
+    // Add upload tab if not exists
+    const tabs = document.querySelector('.source-tabs');
+    if (!tabs.querySelector('[onclick*="upload"]')) {
+        const tab = document.createElement('div');
+        tab.className = 'source-tab';
+        tab.setAttribute('onclick', "switchSource('upload')");
+        tab.textContent = 'Local Files';
+        tabs.appendChild(tab);
+    }
+    loadedSources['upload'] = true;
+    switchSource('upload');
 }
 
 // Init
@@ -699,6 +845,56 @@ class MaestroHandler(BaseHTTPRequestHandler):
 
     def send_error_json(self, message, status=500):
         self.send_json({"error": message}, status)
+
+    def _find_upload(self, strat_id):
+        """Find a raw strategy file in local_files/ matching this ID."""
+        import hashlib
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_files")
+        if not os.path.isdir(upload_dir):
+            return None
+        for f in os.listdir(upload_dir):
+            if not f.endswith((".json", ".txt")):
+                continue
+            # Match by file-hash ID scheme
+            file_hash = hashlib.md5(f.encode()).hexdigest()[:12]
+            if strat_id == f"local_{file_hash}":
+                return os.path.join(upload_dir, f)
+        return None
+
+    def _backtest_upload(self, filepath, strat_id):
+        """Run Rainboy backtest on a raw strategy file, cache the result."""
+        try:
+            from data_loader import run_rainboy_backtest
+            with open(filepath) as fh:
+                strat_data = json.load(fh)
+            strat_name = strat_data.get("name", Path(filepath).stem)
+
+            print(f"  [analyze] Backtesting upload '{strat_name}'...")
+            report_data = run_rainboy_backtest(filepath)
+
+            # Convert to cache format
+            dvm = {}
+            for date_str, val in zip(report_data["dates"], report_data["equity"]):
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                epoch_day = (dt - datetime(1970, 1, 1)).days
+                dvm[str(epoch_day)] = val
+
+            cache = {
+                "symphony_id": strat_id,
+                "cached_at": datetime.now().isoformat(),
+                "backtest": {
+                    "dvm_capital": {strat_id: dvm},
+                    "legend": {strat_id: {"name": strat_name}},
+                }
+            }
+            cache_path = os.path.join(BACKTEST_DIR, f"{strat_id}.json")
+            with open(cache_path, "w") as f:
+                json.dump(cache, f)
+            print(f"  [analyze] OK '{strat_name}'")
+            return True
+        except Exception as e:
+            print(f"  [analyze] Backtest failed for {filepath}: {e}")
+            return False
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -751,26 +947,57 @@ class MaestroHandler(BaseHTTPRequestHandler):
                 self.send_error_json(str(e))
 
         elif path == "/api/strategies/local":
-            # List already-cached backtest files
+            # Only show files in local_files/ — user-managed, no temp cache
             strategies = []
-            for f in sorted(os.listdir(BACKTEST_DIR)):
-                if not f.endswith(".json"):
+            local_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_files")
+            os.makedirs(local_dir, exist_ok=True)
+            already_ids = set()
+
+            for f in sorted(os.listdir(local_dir)):
+                if not f.endswith((".json", ".txt")):
                     continue
-                filepath = os.path.join(BACKTEST_DIR, f)
+                filepath = os.path.join(local_dir, f)
                 try:
                     with open(filepath) as fh:
-                        cache = json.load(fh)
-                    bt = cache.get("backtest", cache)
-                    legend = bt.get("legend", {})
-                    sid = cache.get("symphony_id", f.replace(".json", ""))
-                    name = legend.get(sid, {}).get("name", sid)
-                    start, end, days = get_strategy_date_range(cache)
-                    strategies.append({
-                        "id": sid, "name": name, "source": "local",
-                        "start": start, "end": end, "days": days,
-                    })
-                except Exception:
+                        strat_data = json.load(fh)
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
+
+                if strat_data.get("step") != "root":
+                    continue  # Not a strategy file
+
+                # Use file-based ID to avoid collisions when multiple files
+                # share the same JSON id (e.g. subgroups extracted from one parent)
+                import hashlib
+                file_hash = hashlib.md5(f.encode()).hexdigest()[:12]
+                strat_id = f"local_{file_hash}"
+                strat_name = strat_data.get("name", os.path.splitext(f)[0])
+
+                # Check if already backtested and cached
+                cache_path = os.path.join(BACKTEST_DIR, f"{strat_id}.json")
+                if strat_id in already_ids:
+                    continue  # Already listed from cache
+
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path) as fh:
+                            cache = json.load(fh)
+                        start, end, days = get_strategy_date_range(cache)
+                        strategies.append({
+                            "id": strat_id, "name": strat_name, "source": "local",
+                            "start": start, "end": end, "days": days,
+                            "cached": True,
+                        })
+                    except Exception:
+                        pass
+                else:
+                    # Not yet backtested — list it, will backtest on analyze
+                    strategies.append({
+                        "id": strat_id, "name": strat_name, "source": "local",
+                        "start": None, "end": None, "days": 0,
+                        "cached": False, "_upload_path": filepath,
+                    })
+
             self.send_json({"strategies": strategies})
 
         elif path.startswith("/reports/"):
@@ -801,28 +1028,137 @@ class MaestroHandler(BaseHTTPRequestHandler):
             ids = body.get("ids", [])
             start_date = body.get("start")
             end_date = body.get("end")
+            synthetic = body.get("synthetic", False)
+            synthetic_engine = body.get("synthetic_engine", "hybrid")
+            save_local = body.get("save_local", False)
 
             if len(ids) < 2:
                 self.send_error_json("Need at least 2 strategies", 400)
                 return
 
             try:
-                # Load backtest data for each strategy
-                all_strategies = []
+                # Phase 1: Load Composer backtests + Rainboy data for each strategy
+                strategy_pairs = []  # [{composer, rainboy, sid}, ...]
                 failed_ids = []
                 for sid in ids:
+                    # Load Composer backtest
                     cache_path = os.path.join(BACKTEST_DIR, f"{sid}.json")
                     if not os.path.exists(cache_path):
-                        cache = fetch_backtest(sid)
-                        if not cache:
-                            failed_ids.append(sid)
-                            continue
+                        uploaded = self._find_upload(sid)
+                        if uploaded:
+                            if not self._backtest_upload(uploaded, sid):
+                                failed_ids.append(sid)
+                                continue
+                        else:
+                            cache = fetch_backtest(sid)
+                            if not cache:
+                                failed_ids.append(sid)
+                                continue
                     try:
-                        data = load_composer_backtest_json(cache_path)
-                        all_strategies.append(data)
+                        composer_data = load_composer_backtest_json(cache_path)
                     except Exception as e:
                         print(f"  [analyze] Error parsing {sid}: {e}")
                         failed_ids.append(sid)
+                        continue
+
+                    # Load Rainboy data if synthetic mode
+                    rainboy_data = None
+                    if synthetic:
+                        synth_cache = os.path.join(BACKTEST_DIR, f"{sid}_synthetic.json")
+
+                        # Check if cached synthetic is still valid:
+                        # - Must exist
+                        # - Source file in uploads/ must not be newer than cache
+                        # - Cache must be from this session (< 30 min)
+                        if os.path.exists(synth_cache):
+                            cache_mtime = os.path.getmtime(synth_cache)
+                            source_file = self._find_upload(sid)
+                            stale = (datetime.now().timestamp() - cache_mtime) > 1800
+                            source_updated = source_file and os.path.getmtime(source_file) > cache_mtime
+                            if not stale and not source_updated:
+                                try:
+                                    rainboy_data = load_composer_backtest_json(synth_cache)
+                                except Exception:
+                                    pass
+                            elif source_updated:
+                                print(f"  [analyze] Synthetic cache stale for {sid} — source file updated")
+
+                        if not rainboy_data:
+                            uploaded = self._find_upload(sid)
+                            if not uploaded:
+                                print(f"  [analyze] Synthetic: Fetching strategy code for {sid} from Composer API...")
+                                code = fetch_symphony_code(sid)
+                                if code:
+                                    # Save to temp dir, not uploads/ (uploads is user-managed)
+                                    import tempfile
+                                    fetched_path = os.path.join(tempfile.gettempdir(), f"maestro_{sid}.json")
+                                    with open(fetched_path, "w") as f:
+                                        json.dump(code, f, indent=2)
+                                    print(f"  [analyze] Fetched strategy code: {code.get('name', sid)}")
+                                    uploaded = fetched_path
+
+                            if uploaded:
+                                if self._backtest_upload(uploaded, f"{sid}_synthetic"):
+                                    try:
+                                        rainboy_data = load_composer_backtest_json(synth_cache)
+                                    except Exception:
+                                        pass
+
+                        if not rainboy_data:
+                            print(f"  [analyze] Synthetic: No Rainboy data for {sid}, Composer only")
+
+                    strategy_pairs.append({
+                        "composer": composer_data,
+                        "rainboy": rainboy_data,
+                        "sid": sid,
+                    })
+
+                # Phase 2: Stitch strategies
+                all_strategies = []
+                if synthetic and any(p["rainboy"] for p in strategy_pairs):
+                    if synthetic_engine == "pure":
+                        # Pure Rainboy: use Rainboy where available, Composer as fallback
+                        for pair in strategy_pairs:
+                            all_strategies.append(pair["rainboy"] or pair["composer"])
+                    else:
+                        # Hybrid with shared junction: prevents correlation artifacts
+                        # by ensuring ALL strategies switch engines at the same date
+                        all_strategies = stitch_hybrid_portfolio(strategy_pairs)
+                else:
+                    # No synthetic, just Composer data
+                    all_strategies = [p["composer"] for p in strategy_pairs]
+
+                # Save to uploads/ if requested
+                if save_local and all_strategies:
+                    upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_files")
+                    os.makedirs(upload_dir, exist_ok=True)
+                    saved = 0
+                    for pair in strategy_pairs:
+                        sid = pair["sid"]
+                        # Save Composer backtest cache
+                        cache_path = os.path.join(BACKTEST_DIR, f"{sid}.json")
+                        if os.path.exists(cache_path):
+                            strat_name = pair["composer"].get("name", sid)
+                            # Clean name for filename
+                            safe_name = re.sub(r'[^\w\s\-\.]', '', strat_name)[:60].strip()
+                            dest = os.path.join(upload_dir, f"{safe_name} ({sid}).json")
+                            if not os.path.exists(dest):
+                                import shutil
+                                shutil.copy2(cache_path, dest)
+                                saved += 1
+                                print(f"  [save] Saved to uploads: {safe_name}")
+                        # Also save strategy code if we fetched it
+                        fetched = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"maestro_{sid}.json")
+                        if os.path.exists(fetched):
+                            strat_name = pair["composer"].get("name", sid)
+                            safe_name = re.sub(r'[^\w\s\-\.]', '', strat_name)[:60].strip()
+                            code_dest = os.path.join(upload_dir, f"{safe_name} ({sid}) code.json")
+                            if not os.path.exists(code_dest):
+                                import shutil
+                                shutil.copy2(fetched, code_dest)
+                                print(f"  [save] Saved strategy code to uploads: {safe_name}")
+                    if saved:
+                        print(f"  [save] Saved {saved} backtest(s) to uploads/")
 
                 if failed_ids:
                     print(f"  [analyze] Failed to load: {failed_ids}")
@@ -928,6 +1264,103 @@ class MaestroHandler(BaseHTTPRequestHandler):
                 import traceback
                 traceback.print_exc()
                 self.send_error_json(str(e))
+
+        elif parsed.path == "/api/clear-cache":
+            try:
+                count = 0
+                for f in os.listdir(BACKTEST_DIR):
+                    if f.endswith(".json"):
+                        os.remove(os.path.join(BACKTEST_DIR, f))
+                        count += 1
+                print(f"  [cache] Cleared {count} cached backtests")
+                self.send_json({"message": f"Cleared {count} cached backtests"})
+            except Exception as e:
+                self.send_error_json(str(e))
+
+        elif parsed.path == "/api/upload":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len).decode())
+
+            filename = body.get("filename", "unknown.json")
+            content = body.get("content", "")
+
+            try:
+                strat_data = json.loads(content)
+            except json.JSONDecodeError:
+                self.send_error_json("File is not valid JSON", 400)
+                return
+
+            if strat_data.get("step") != "root":
+                # Could be a Composer backtest cache — check for dvm_capital
+                if "dvm_capital" in strat_data or "dvm_capital" in strat_data.get("backtest", {}):
+                    sid = strat_data.get("symphony_id", os.path.splitext(filename)[0])
+                    cache_path = os.path.join(BACKTEST_DIR, f"{sid}.json")
+                    with open(cache_path, "w") as f:
+                        json.dump(strat_data, f)
+                    start, end, days = get_strategy_date_range(strat_data)
+                    bt = strat_data.get("backtest", strat_data)
+                    legend = bt.get("legend", {})
+                    name = legend.get(sid, {}).get("name", filename)
+                    self.send_json({"strategy": {
+                        "id": sid, "name": name, "start": start, "end": end,
+                        "days": days, "cached": True,
+                    }})
+                    return
+                self.send_error_json("Not a Composer strategy (missing step:root) or backtest cache", 400)
+                return
+
+            # It's a strategy JSON — save it and run Rainboy backtest
+            strat_name = strat_data.get("name", os.path.splitext(filename)[0])
+            strat_id = strat_data.get("id", f"upload_{hash(content) & 0xFFFFFFFF:08x}")
+
+            print(f"  [upload] Backtesting '{strat_name}'...")
+
+            # Save strategy JSON to temp file
+            UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_files")
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            strat_path = os.path.join(UPLOAD_DIR, f"{strat_id}.json")
+            with open(strat_path, "w") as f:
+                json.dump(strat_data, f, indent=2)
+
+            # Run Rainboy backtest
+            try:
+                from data_loader import run_rainboy_backtest
+                report_data = run_rainboy_backtest(strat_path)
+                # Convert to Composer-style cache format so analyze can load it
+                import pandas as pd
+                dates = report_data["dates"]
+                equity = report_data["equity"]
+                # Build dvm_capital: {strategy_id: {epoch_day: capital}}
+                dvm = {}
+                for date_str, val in zip(dates, equity):
+                    dt = datetime.strptime(date_str, "%Y-%m-%d")
+                    epoch_day = (dt - datetime(1970, 1, 1)).days
+                    dvm[str(epoch_day)] = val
+
+                cache = {
+                    "symphony_id": strat_id,
+                    "cached_at": datetime.now().isoformat(),
+                    "backtest": {
+                        "dvm_capital": {strat_id: dvm},
+                        "legend": {strat_id: {"name": strat_name}},
+                    }
+                }
+                cache_path = os.path.join(BACKTEST_DIR, f"{strat_id}.json")
+                with open(cache_path, "w") as f:
+                    json.dump(cache, f)
+
+                start, end, days = get_strategy_date_range(cache)
+                print(f"  [upload] OK '{strat_name}': {days} days ({start} to {end})")
+
+                self.send_json({"strategy": {
+                    "id": strat_id, "name": strat_name, "start": start, "end": end,
+                    "days": days, "cached": True,
+                }})
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.send_error_json(f"Backtest failed for {strat_name}: {e}")
 
         else:
             self.send_error(404)

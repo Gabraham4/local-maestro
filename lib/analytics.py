@@ -119,11 +119,37 @@ def optimize_portfolios(returns_df: pd.DataFrame, n_random: int = 50000,
                                 (wDw - w_sq_sum) / (1.0 - w_sq_sum), 0)
     mean_dd_corr = np.clip(mean_dd_corr, -1, 1)
 
-    # Smart Sharpe = Sharpe / (1 + mean_corr)
-    smart_sharpe = np.where((1 + mean_corr) > 0.01, sharpe / (1 + mean_corr), 0)
+    # CARP = Sortino / (1 + mean_corr) — Correlation-Adjusted Risk-adjusted Performance
+    carp = np.where((1 + mean_corr) > 0.01, sortino / (1 + mean_corr), 0)
 
-    # Smart Sortino = Sortino / (1 + mean_dd_corr)
-    smart_sortino = np.where((1 + mean_dd_corr) > 0.01, sortino / (1 + mean_dd_corr), 0)
+    # Smart CARP = Sortino / (1 + mean_dd_corr) — drawdown-correlation-adjusted
+    smart_carp = np.where((1 + mean_dd_corr) > 0.01, sortino / (1 + mean_dd_corr), 0)
+
+    # ── Smart Sharpe / Smart Sortino (Lo 2002 autocorrelation adjustment) ──
+    # Adjusts for serial correlation in returns that inflates naive Sharpe/Sortino.
+    # penalty = sqrt(1 + 2 * sum_{k=1}^{q} (1 - k/(q+1)) * rho_k)
+    # where rho_k = autocorrelation at lag k, q = number of lags (typically ~6 for daily)
+    q_lags = min(6, n_days // 10)  # number of autocorrelation lags
+    # Compute autocorrelation penalty per portfolio
+    ac_penalty = np.ones(N)
+    if q_lags > 0 and n_days > q_lags + 1:
+        for lag in range(1, q_lags + 1):
+            # Autocorrelation at lag k for each portfolio: corr(r_t, r_{t-k})
+            r_early = P[:, :-lag]  # (N, n_days-lag)
+            r_late = P[:, lag:]    # (N, n_days-lag)
+            # Pearson correlation per row
+            m_early = r_early.mean(axis=1, keepdims=True)
+            m_late = r_late.mean(axis=1, keepdims=True)
+            num = np.sum((r_early - m_early) * (r_late - m_late), axis=1)
+            den = np.sqrt(np.sum((r_early - m_early)**2, axis=1) *
+                          np.sum((r_late - m_late)**2, axis=1))
+            rho_k = np.where(den > 1e-12, num / den, 0)
+            weight = 1.0 - lag / (q_lags + 1)  # Bartlett kernel weight
+            ac_penalty += 2 * weight * rho_k
+    ac_penalty = np.sqrt(np.maximum(ac_penalty, 0.01))  # Floor to avoid division by ~0
+
+    smart_sharpe = sharpe / ac_penalty
+    smart_sortino = sortino / ac_penalty
 
     # ── CAPM Alpha vs benchmark (if provided) ──
     # alpha = portfolio_ann_return - (risk_free + beta * (benchmark_ann_return - risk_free))
@@ -152,8 +178,10 @@ def optimize_portfolios(returns_df: pd.DataFrame, n_random: int = 50000,
     sharpe = np.clip(sharpe, -10, 30)
     sortino = np.clip(sortino, -10, 50)
     calmar = np.clip(calmar, -5, 20)
-    smart_sharpe = np.clip(smart_sharpe, -10, 40)
-    smart_sortino = np.clip(smart_sortino, -10, 60)
+    smart_sharpe = np.clip(smart_sharpe, -10, 30)
+    smart_sortino = np.clip(smart_sortino, -10, 50)
+    carp = np.clip(carp, -10, 40)
+    smart_carp = np.clip(smart_carp, -10, 60)
     profit_factor = np.clip(profit_factor, 0, 20)
     serenity = np.clip(serenity, -20, 100)
 
@@ -174,6 +202,8 @@ def optimize_portfolios(returns_df: pd.DataFrame, n_random: int = 50000,
         "decorrelation": decorrelation.round(3).tolist(),
         "smart_sharpe": smart_sharpe.round(3).tolist(),
         "smart_sortino": smart_sortino.round(3).tolist(),
+        "carp": carp.round(3).tolist(),
+        "smart_carp": smart_carp.round(3).tolist(),
         "serenity": serenity.round(2).tolist(),
         "alpha": alpha.round(2).tolist(),
         "equal_weight_idx": 0,

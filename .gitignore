@@ -7,6 +7,11 @@ __pycache__/
 backtest_data/*.json
 !backtest_data/.gitkeep
 
+# User's local strategy files
+local_files/*.json
+local_files/*.txt
+!local_files/.gitkeep
+
 # OS files
 .DS_Store
 

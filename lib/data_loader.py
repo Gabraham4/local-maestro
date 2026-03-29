@@ -122,6 +122,12 @@ def load_rainboy_html_report(filepath: str) -> Dict:
     if "dates" not in data or "equity" not in data:
         raise ValueError(f"Could not extract dates/equity from {filepath}")
 
+    # Align lengths — Rainboy reports may have equity[0] as starting value before first date
+    dates = data["dates"]
+    equity = data["equity"]
+    if len(equity) == len(dates) + 1:
+        equity = equity[1:]  # trim leading starting value
+
     # Extract strategy name from report title
     title_match = re.search(r"<title>([^<]+)</title>", html)
     name = title_match.group(1).strip() if title_match else Path(filepath).stem
@@ -129,8 +135,8 @@ def load_rainboy_html_report(filepath: str) -> Dict:
     return {
         "name": name,
         "id": Path(filepath).stem,
-        "dates": data["dates"],
-        "equity": data["equity"],
+        "dates": dates,
+        "equity": equity,
     }
 
 
@@ -148,6 +154,9 @@ def run_rainboy_backtest(strategy_json_path: str, backtest_sh_path: str = None,
 
     if not os.path.exists(backtest_sh_path):
         raise FileNotFoundError(f"Rainboy backtester not found at {backtest_sh_path}")
+
+    # Ensure absolute path for backtest.sh
+    strategy_json_path = os.path.abspath(strategy_json_path)
 
     # Extract strategy name from JSON
     with open(strategy_json_path, "r") as f:
@@ -191,6 +200,123 @@ def run_rainboy_backtest(strategy_json_path: str, backtest_sh_path: str = None,
     report_data["name"] = strategy_name
 
     return report_data
+
+
+def stitch_hybrid_backtest(composer_data: Dict, rainboy_data: Dict) -> Dict:
+    """
+    Per-strategy stitch (legacy fallback). Use stitch_hybrid_portfolio() for
+    multi-strategy analysis to avoid correlation artifacts.
+    """
+    if not composer_data.get("dates"):
+        return rainboy_data
+    return _stitch_single(composer_data, rainboy_data, composer_data["dates"][0])
+
+
+def _stitch_single(composer_data: Dict, rainboy_data: Dict, junction_date: str) -> Dict:
+    """
+    Stitch a single strategy at a specific junction date.
+    Before junction: Rainboy data. From junction onwards: Composer data.
+    Rebased at junction so equity curves connect seamlessly.
+    """
+    c_dates = composer_data["dates"]
+    c_equity = composer_data["equity"]
+    r_dates = rainboy_data["dates"]
+    r_equity = rainboy_data["equity"]
+
+    if not c_dates or not r_dates:
+        return composer_data if c_dates else rainboy_data
+
+    # Rainboy data before the junction
+    pre_dates = []
+    pre_equity = []
+    for d, e in zip(r_dates, r_equity):
+        if d < junction_date:
+            pre_dates.append(d)
+            pre_equity.append(e)
+
+    if not pre_dates:
+        return composer_data
+
+    # Composer data from junction onwards
+    post_dates = []
+    post_equity = []
+    for d, e in zip(c_dates, c_equity):
+        if d >= junction_date:
+            post_dates.append(d)
+            post_equity.append(e)
+
+    if not post_dates:
+        return rainboy_data
+
+    # Rebase Rainboy pre-period to match Composer's value at junction
+    rainboy_last = pre_equity[-1]
+    composer_at_junction = post_equity[0]
+    scale = composer_at_junction / rainboy_last if rainboy_last > 0 else 1.0
+    pre_equity_rebased = [e * scale for e in pre_equity]
+
+    merged_dates = pre_dates + post_dates
+    merged_equity = pre_equity_rebased + post_equity
+
+    print(f"  [hybrid] Stitched at {junction_date}: "
+          f"{len(pre_dates)} Rainboy days + {len(post_dates)} Composer days "
+          f"= {len(merged_dates)} total")
+
+    return {
+        "name": composer_data.get("name", rainboy_data.get("name", "Unknown")),
+        "id": composer_data.get("id", rainboy_data.get("id", "")),
+        "dates": merged_dates,
+        "equity": merged_equity,
+    }
+
+
+def stitch_hybrid_portfolio(strategy_pairs: List[Dict]) -> List[Dict]:
+    """
+    Multi-strategy hybrid stitch with a SHARED junction date.
+
+    The junction is the latest Composer start date across all strategies.
+    Before the junction: ALL strategies use Rainboy (same price source).
+    After the junction: ALL strategies use Composer (same price source).
+
+    This prevents correlation artifacts from mixing Yahoo (Rainboy) and
+    Xignite (Composer) price data within the same time window.
+
+    Args:
+        strategy_pairs: List of dicts with keys:
+            - "composer": Composer backtest data (dates, equity, name, id)
+            - "rainboy": Rainboy backtest data (dates, equity, name, id) or None
+
+    Returns:
+        List of stitched strategy dicts in the same order.
+    """
+    # Find the latest Composer start date — this becomes the shared junction
+    composer_starts = []
+    for pair in strategy_pairs:
+        c = pair.get("composer")
+        if c and c.get("dates"):
+            composer_starts.append(c["dates"][0])
+
+    if not composer_starts:
+        return [p.get("rainboy") or p["composer"] for p in strategy_pairs]
+
+    # Shared junction = latest Composer start (so ALL strategies have Composer data after it)
+    junction = max(composer_starts)
+    print(f"  [hybrid] Shared junction date: {junction} "
+          f"(latest of {len(composer_starts)} Composer start dates)")
+
+    results = []
+    for pair in strategy_pairs:
+        composer = pair["composer"]
+        rainboy = pair.get("rainboy")
+        name = composer.get("name", "?")[:40]
+
+        if rainboy and rainboy.get("dates"):
+            stitched = _stitch_single(composer, rainboy, junction)
+            results.append(stitched)
+        else:
+            print(f"  [hybrid] {name}: No Rainboy data, using Composer only")
+            results.append(composer)
+
+    return results
 
 
 def load_csv(filepath: str) -> Dict:
@@ -258,7 +384,20 @@ def load_from_path(filepath: str, **kwargs) -> list:
         return [load_rainboy_html_report(filepath)]
 
     else:
-        raise ValueError(f"Unsupported file type: {path.suffix}")
+        # Try parsing as JSON regardless of extension (.txt, etc.)
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            if "dvm_capital" in data:
+                return [load_composer_backtest_json(filepath)]
+            elif "backtest" in data and "dvm_capital" in data.get("backtest", {}):
+                return [load_composer_backtest_json(filepath)]
+            elif "step" in data and data.get("step") == "root":
+                return [run_rainboy_backtest(filepath, **kwargs)]
+            else:
+                raise ValueError(f"Unrecognized JSON format in {filepath}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
 def align_strategies(strategies: List[Dict], start_date: str = None,
@@ -297,30 +436,11 @@ def align_strategies(strategies: List[Dict], start_date: str = None,
     if len(dfs) < 2:
         raise ValueError("Not enough strategies with data in the requested date range")
 
-    # Find the date range that most strategies cover
-    # Strategy: use outer join, then pick the window where most strategies have data
-    df_outer = pd.concat(dfs, axis=1, join="outer").sort_index()
-
-    # Count non-null strategies per date
-    coverage = df_outer.notna().sum(axis=1)
-
-    # Find the longest contiguous window where >= 90% of strategies have data
-    # Start from the date where coverage first reaches max, going forward
-    max_coverage = coverage.max()
-    threshold = max(2, int(max_coverage * min_overlap_pct))
-
-    # Dates where enough strategies have data
-    good_dates = coverage[coverage >= threshold].index
-
-    if len(good_dates) < 2:
-        # Fallback: strict inner join
-        df = pd.concat(dfs, axis=1, join="inner").sort_index()
-    else:
-        df = df_outer.loc[good_dates]
-        # Drop strategies that have too many missing values in this range
-        missing_pct = df.isna().mean()
-        keep_cols = missing_pct[missing_pct < 0.1].index  # Keep strategies with <10% missing
-        df = df[keep_cols].dropna()  # Drop any remaining NaN rows
+    # Use inner join — only keep dates where ALL selected strategies have data.
+    # This trims the window to the shortest strategy rather than silently dropping it.
+    df = pd.concat(dfs, axis=1, join="inner").sort_index()
+    df = df.dropna()  # Drop any remaining NaN rows
+    print(f"  Aligned: {len(df)} trading days from {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
 
     if len(df) < 2:
         raise ValueError("Not enough overlapping data points after alignment")

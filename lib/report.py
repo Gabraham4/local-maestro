@@ -505,23 +505,6 @@ select {{
                             <option value="20000">20,000</option>
                         </select>
                     </div>
-                    <div class="opt-setting">
-                        <label>Color By</label>
-                        <select id="opt-heatmap" onchange="optUpdateHeatmap()">
-                            <option value="sharpe">Sharpe Ratio</option>
-                            <option value="sortino" selected>Sortino Ratio</option>
-                            <option value="smart_sharpe">Smart Sharpe</option>
-                            <option value="smart_sortino">Smart Sortino</option>
-                            <option value="calmar">Calmar Ratio</option>
-                            <option value="serenity">Serenity</option>
-                            <option value="decorrelation">De-correlation</option>
-                            <option value="profit_factor">Profit Factor</option>
-                            <option value="win_rate">Win Rate %</option>
-                            <option value="alpha">Alpha vs SPY</option>
-                            <option value="max_dd">Max Drawdown</option>
-                            <option value="ann_return">Annual Return</option>
-                        </select>
-                    </div>
                     <button class="btn btn-primary" id="opt-run-btn" onclick="optRunOptimization()" style="padding:10px 28px;font-size:14px;">
                         Run Optimization
                     </button>
@@ -529,20 +512,19 @@ select {{
                 <div class="opt-info" id="opt-info" style="display:none;">
                     <span id="opt-info-text"></span>
                 </div>
-                <div class="opt-filter-row" id="opt-filter-row" style="display:none;">
-                    <label>Filter by</label>
-                    <select id="opt-filter-metric">
-                        <option value="sharpe">Sharpe</option>
-                        <option value="sortino" selected>Sortino</option>
-                        <option value="smart_sharpe">Smart Sharpe</option>
-                        <option value="smart_sortino">Smart Sortino</option>
-                        <option value="calmar">Calmar</option>
-                        <option value="serenity">Serenity</option>
-                        <option value="decorrelation">De-correlation</option>
-                        <option value="profit_factor">Profit Factor</option>
-                        <option value="alpha">Alpha vs SPY</option>
-                        <option value="ann_return">Return</option>
-                    </select>
+                <div class="opt-filter-row" id="opt-filter-row" style="display:none;align-items:center;">
+                    <label>Metric</label>
+                    <div style="position:relative;display:inline-block;">
+                        <div id="opt-metric-btn" onclick="document.getElementById('opt-metric-dropdown').classList.toggle('visible')"
+                            style="background:#1a2332;border:1px solid #2a3a4a;border-radius:4px;padding:6px 12px;
+                            cursor:pointer;color:#c0d0e0;font-size:13px;min-width:200px;user-select:none;">
+                            Sortino
+                        </div>
+                        <div id="opt-metric-dropdown" style="display:none;position:absolute;top:100%;left:0;z-index:50;
+                            background:#1a2332;border:1px solid #2a3a4a;border-radius:4px;padding:6px 0;
+                            min-width:220px;max-height:340px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,0.4);">
+                        </div>
+                    </div>
                     <label>Top</label>
                     <select id="opt-filter-mode">
                         <option value="pct">%</option>
@@ -552,6 +534,13 @@ select {{
                     <button class="opt-btn" onclick="optApplyFilter()">Apply Filter</button>
                     <button class="opt-btn" onclick="optClearFilter()">Clear</button>
                 </div>
+                <style>
+                    #opt-metric-dropdown.visible {{ display: block !important; }}
+                    .ohm-item {{ display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-size:13px;color:#8899aa; }}
+                    .ohm-item:hover {{ background:#1e2d3d;color:#c0d0e0; }}
+                    .ohm-item input {{ width:16px;height:16px;cursor:pointer; }}
+                    .ohm-item.checked {{ color:#f0a030; }}
+                </style>
                 <div class="chart-box" style="margin-top:12px;">
                     <div id="opt-chart" style="height:550px;">
                         <div style="padding:80px 40px;text-align:center;color:#4a5a6a;">
@@ -932,6 +921,8 @@ function exportCurrentTab() {{
         text += arrStats(optData.smart_sharpe, 'SmartSharpe') + '\\n';
         text += arrStats(optData.sortino, 'Sortino') + '\\n';
         text += arrStats(optData.smart_sortino, 'SmartSortino') + '\\n';
+        text += arrStats(optData.carp || [], 'CARP') + '\\n';
+        text += arrStats(optData.smart_carp || [], 'SmartCARP') + '\\n';
         text += arrStats(optData.max_dd, 'MaxDD%') + '\\n';
         text += arrStats(optData.calmar, 'Calmar') + '\\n';
         text += arrStats(optData.serenity, 'Serenity') + '\\n';
@@ -1083,22 +1074,117 @@ function optRunOptimization() {{
     }});
 }}
 
+// Unified metric selection — drives both coloring and filtering
+const OPT_METRICS = [
+    {{ key: 'sortino', label: 'Sortino', invert: false }},
+    {{ key: 'sharpe', label: 'Sharpe', invert: false }},
+    {{ key: 'smart_sortino', label: 'Smart Sortino (autocorr-adj)', invert: false }},
+    {{ key: 'smart_sharpe', label: 'Smart Sharpe (autocorr-adj)', invert: false }},
+    {{ key: 'carp', label: 'CARP (corr-adj Sortino)', invert: false }},
+    {{ key: 'smart_carp', label: 'Smart CARP (DD-corr-adj)', invert: false }},
+    {{ key: 'calmar', label: 'Calmar Ratio', invert: false }},
+    {{ key: 'serenity', label: 'Serenity', invert: false }},
+    {{ key: 'ann_return', label: 'Annual Return %', invert: false }},
+    {{ key: 'decorrelation', label: 'De-correlation', invert: false }},
+    {{ key: 'profit_factor', label: 'Profit Factor', invert: false }},
+    {{ key: 'win_rate', label: 'Win Rate %', invert: false }},
+    {{ key: 'alpha', label: 'Alpha vs SPY', invert: false }},
+    {{ key: 'max_dd', label: 'Max Drawdown', invert: true }},
+];
+let optSelectedMetrics = ['sortino'];
+
+function optInitMetricDropdown() {{
+    const dd = document.getElementById('opt-metric-dropdown');
+    if (!dd) return;
+    dd.innerHTML = OPT_METRICS.map(m => `
+        <label class="ohm-item ${{optSelectedMetrics.includes(m.key) ? 'checked' : ''}}" data-key="${{m.key}}">
+            <input type="checkbox" ${{optSelectedMetrics.includes(m.key) ? 'checked' : ''}}
+                onchange="optToggleMetric('${{m.key}}', this.checked, this.parentElement)">
+            ${{m.label}}
+        </label>
+    `).join('');
+    document.addEventListener('click', (e) => {{
+        if (!e.target.closest('#opt-metric-btn') && !e.target.closest('#opt-metric-dropdown')) {{
+            dd.classList.remove('visible');
+        }}
+    }});
+}}
+
+function optToggleMetric(key, checked, el) {{
+    if (checked) {{
+        if (!optSelectedMetrics.includes(key)) optSelectedMetrics.push(key);
+        el.classList.add('checked');
+    }} else {{
+        optSelectedMetrics = optSelectedMetrics.filter(k => k !== key);
+        el.classList.remove('checked');
+    }}
+    // Update button label
+    const btn = document.getElementById('opt-metric-btn');
+    if (optSelectedMetrics.length === 0) {{
+        btn.textContent = '(none selected)';
+    }} else if (optSelectedMetrics.length === 1) {{
+        btn.textContent = OPT_METRICS.find(m => m.key === optSelectedMetrics[0]).label;
+    }} else {{
+        btn.textContent = optSelectedMetrics.length + ' metrics (averaged)';
+    }}
+    // Re-color chart immediately (no filter change)
+    if (optData) optRenderChart();
+}}
+
+function optComputeComboScore() {{
+    // For each selected metric, normalize to 0-1 range (higher=better), then average.
+    const N = optData.ann_vol.length;
+    if (optSelectedMetrics.length === 0) return new Array(N).fill(0);
+
+    const normalized = [];
+    for (const key of optSelectedMetrics) {{
+        const vals = optData[key];
+        const meta = OPT_METRICS.find(m => m.key === key);
+        let min = Infinity, max = -Infinity;
+        for (let i = 0; i < N; i++) {{ if (vals[i] < min) min = vals[i]; if (vals[i] > max) max = vals[i]; }}
+        const range = max - min || 1;
+        const norm = new Array(N);
+        for (let i = 0; i < N; i++) {{
+            let v = (vals[i] - min) / range;  // 0 to 1
+            if (meta && meta.invert) v = 1 - v;  // Flip so higher = better
+            norm[i] = v;
+        }}
+        normalized.push(norm);
+    }}
+    // Average across selected metrics
+    const combo = new Array(N).fill(0);
+    for (let i = 0; i < N; i++) {{
+        for (const norm of normalized) combo[i] += norm[i];
+        combo[i] /= normalized.length;
+    }}
+    return combo;
+}}
+
 function optRenderChart() {{
     if (!optData) return;
 
-    const metric = document.getElementById('opt-heatmap').value;
-    const metricLabel = {{
-        sharpe: 'Sharpe Ratio', sortino: 'Sortino Ratio', calmar: 'Calmar Ratio',
-        max_dd: 'Max Drawdown %', ann_return: 'Annual Return %',
-        smart_sharpe: 'Smart Sharpe', smart_sortino: 'Smart Sortino',
-        serenity: 'Serenity', decorrelation: 'De-correlation',
-        profit_factor: 'Profit Factor', win_rate: 'Win Rate %',
-        alpha: 'Alpha vs SPY', mean_corr: 'Mean Correlation',
-    }}[metric] || metric;
+    const selectedKeys = optSelectedMetrics;
+    let colorVals, metricLabel, isMulti;
+
+    if (selectedKeys.length === 0) {{
+        colorVals = optData.sortino;
+        metricLabel = 'Sortino';
+        isMulti = false;
+    }} else if (selectedKeys.length === 1) {{
+        // Single metric: use RAW values so the colorbar shows actual Sharpe/Sortino/etc.
+        const key = selectedKeys[0];
+        colorVals = optData[key];
+        metricLabel = OPT_METRICS.find(m => m.key === key).label;
+        isMulti = false;
+    }} else {{
+        // Multi-metric: use normalized 0-1 combo score
+        colorVals = optComputeComboScore();
+        metricLabel = selectedKeys.length + '-metric combo';
+        isMulti = true;
+    }}
 
     const x = optData.ann_vol;
     const y = optData.ann_return;
-    const colorVals = optData[metric];
     const N = x.length;
 
     // Determine visible indices
@@ -1109,9 +1195,10 @@ function optRenderChart() {{
     const cVis = indices.map(i => colorVals[i]);
     const customdata = indices.map(i => i);  // Store original index for click
 
-    // Color scale: green=good, red=bad. Invert for metrics where lower=better.
+    // Color scale: green=good, red=bad. Invert for single metrics where lower=better.
     const invertedMetrics = ['max_dd', 'mean_corr', 'ann_vol'];
-    const colorscale = invertedMetrics.includes(metric)
+    const needInvert = !isMulti && selectedKeys.length === 1 && invertedMetrics.includes(selectedKeys[0]);
+    const colorscale = needInvert
         ? [[0, '#1a9850'], [0.5, '#fee08b'], [1, '#d73027']]
         : [[0, '#d73027'], [0.3, '#fee08b'], [0.7, '#66bd63'], [1, '#1a9850']];
 
@@ -1190,16 +1277,27 @@ function optShowWeights(idx) {{
 
 function optApplyFilter() {{
     if (!optData) return;
-    const metric = document.getElementById('opt-filter-metric').value;
     const mode = document.getElementById('opt-filter-mode').value;
     const value = parseInt(document.getElementById('opt-filter-value').value);
-    const vals = optData[metric];
+
+    let vals;
+    if (optSelectedMetrics.length <= 1) {{
+        // Single metric: use raw values, handle inversion for sorting
+        const key = optSelectedMetrics[0] || 'sortino';
+        vals = optData[key];
+    }} else {{
+        // Multi-metric: use normalized combo score (higher=better)
+        vals = optComputeComboScore();
+    }}
     const N = vals.length;
 
-    // Sort indices by metric (descending, except max_dd which is ascending for "best")
+    // Sort indices by metric (descending = higher is better)
+    // For max_dd (more negative = worse), descending still works: -10 > -30
     const sorted = Array.from({{ length: N }}, (_, i) => i);
-    if (metric === 'max_dd') {{
-        sorted.sort((a, b) => vals[b] - vals[a]);  // Less negative = better
+    const meta = optSelectedMetrics.length === 1 ? OPT_METRICS.find(m => m.key === optSelectedMetrics[0]) : null;
+    if (meta && meta.invert) {{
+        // Inverted: lower raw value = better (e.g. max_dd: -5% better than -30%)
+        sorted.sort((a, b) => vals[b] - vals[a]);  // -5 > -30, so descending puts best first
     }} else {{
         sorted.sort((a, b) => vals[b] - vals[a]);  // Higher = better
     }}
@@ -1212,8 +1310,11 @@ function optApplyFilter() {{
     }}
 
     optFiltered = sorted.slice(0, count);
+    const metricLabel = optSelectedMetrics.length === 1
+        ? OPT_METRICS.find(m => m.key === optSelectedMetrics[0]).label
+        : optSelectedMetrics.length + '-metric combo';
     document.getElementById('opt-info-text').textContent =
-        `Showing ${{optFiltered.length.toLocaleString()}} / ${{N.toLocaleString()}} portfolios (Top ${{value}}${{mode === 'pct' ? '%' : ''}} by ${{metric}})`;
+        `Showing ${{optFiltered.length.toLocaleString()}} / ${{N.toLocaleString()}} portfolios (Top ${{value}}${{mode === 'pct' ? '%' : ''}} by ${{metricLabel}})`;
     optRenderChart();
 }}
 
@@ -1253,6 +1354,8 @@ function optCalcAverage() {{
     const avgCalmar = avg('calmar');
     const avgSmartSharpe = avg('smart_sharpe');
     const avgSmartSortino = avg('smart_sortino');
+    const avgCarp = avg('carp');
+    const avgSmartCarp = avg('smart_carp');
     const avgSerenity = avg('serenity');
     const avgDecorr = avg('decorrelation');
     const avgPF = avg('profit_factor');
@@ -1281,6 +1384,8 @@ function optCalcAverage() {{
         <div class="opt-metric-row"><span>Smart Sharpe</span><span class="opt-metric-val">${{avgSmartSharpe.toFixed(2)}}</span></div>
         <div class="opt-metric-row"><span>Sortino</span><span class="opt-metric-val">${{avgSortino.toFixed(2)}}</span></div>
         <div class="opt-metric-row"><span>Smart Sortino</span><span class="opt-metric-val">${{avgSmartSortino.toFixed(2)}}</span></div>
+        <div class="opt-metric-row"><span>CARP</span><span class="opt-metric-val">${{avgCarp.toFixed(2)}}</span></div>
+        <div class="opt-metric-row"><span>Smart CARP</span><span class="opt-metric-val">${{avgSmartCarp.toFixed(2)}}</span></div>
         <div class="opt-metric-row"><span>Max DD</span><span class="opt-metric-val">${{avgDD.toFixed(1)}}%</span></div>
         <div class="opt-metric-row"><span>Calmar</span><span class="opt-metric-val">${{avgCalmar.toFixed(2)}}</span></div>
         <div class="opt-metric-row"><span>Serenity</span><span class="opt-metric-val">${{avgSerenity.toFixed(2)}}</span></div>
@@ -1293,7 +1398,10 @@ function optCalcAverage() {{
 }}
 
 // Run on load
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', () => {{
+    init();
+    optInitMetricDropdown();
+}});
 </script>
 </body>
 </html>"""
